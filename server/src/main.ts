@@ -1,4 +1,6 @@
 import fastifyCors from "@fastify/cors";
+import closeWithGrace from "close-with-grace";
+import { randomUUID } from "crypto";
 import dotenv from "dotenv";
 import fastify from "fastify";
 import fastifyIO from "fastify-socket.io";
@@ -11,7 +13,9 @@ const HOST = process.env.HOST || "0.0.0.0";
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "http://localhost:3000";
 const UPSTASH_REDIS_REST_URL = process.env.UPSTASH_REDIS_REST_URL;
 
-const CONNECTION_COUNT_CHANNEL = "chat.connection-count";
+const CONNECTION_COUNT_KEY = "chat:connection-count";
+const CONNECTION_COUNT_UPDATED_CHANNEL = "chat:connection-count-updated";
+const NEW_MESSAGE_CHANNEL = "chat:new-message";
 
 if (!UPSTASH_REDIS_REST_URL) {
   console.error("UPSTASH_REDIS_REST_URL is not defined");
@@ -19,6 +23,9 @@ if (!UPSTASH_REDIS_REST_URL) {
 }
 
 const publisher = new Redis(UPSTASH_REDIS_REST_URL);
+const subscriber = new Redis(UPSTASH_REDIS_REST_URL);
+
+let connectedClients = 0;
 
 async function buildServer() {
   const app = fastify();
@@ -29,12 +36,85 @@ async function buildServer() {
 
   await app.register(fastifyIO);
 
-  app.io.on("connection", (io) => {
+  const currentCount = await publisher.get(CONNECTION_COUNT_KEY);
+
+  app.io.on("connection", async (io) => {
     console.log("IO connected");
 
-    io.on("disconnect", () => {
-      console.log("IO disconnected");
+    const incrResult = await publisher.incr(CONNECTION_COUNT_KEY);
+    connectedClients++;
+
+    await publisher.publish(
+      CONNECTION_COUNT_UPDATED_CHANNEL,
+      String(incrResult)
+    );
+
+    io.on(NEW_MESSAGE_CHANNEL, async (payload) => {
+      const message = payload.message;
+
+      if (!message) {
+        return;
+      }
+
+      console.log(`New message: ${message}`);
+
+      await publisher.publish(NEW_MESSAGE_CHANNEL, message);
     });
+
+    io.on("disconnect", async () => {
+      console.log("IO disconnected");
+
+      const decrResult = await publisher.decr(CONNECTION_COUNT_KEY);
+      connectedClients--;
+
+      await publisher.publish(
+        CONNECTION_COUNT_UPDATED_CHANNEL,
+        String(decrResult)
+      );
+    });
+  });
+
+  subscriber.subscribe(CONNECTION_COUNT_UPDATED_CHANNEL, (err, count) => {
+    if (err) {
+      console.error(
+        `Subscriber error at ${CONNECTION_COUNT_UPDATED_CHANNEL}: ${err}`
+      );
+      return;
+    }
+
+    console.log(
+      `Client count: ${count} at ${CONNECTION_COUNT_UPDATED_CHANNEL}`
+    );
+  });
+
+  subscriber.subscribe(NEW_MESSAGE_CHANNEL, (err, count) => {
+    if (err) {
+      console.error(`Subscriber error at ${NEW_MESSAGE_CHANNEL}: ${err}`);
+      return;
+    }
+
+    console.log(`Client count: ${count} at ${NEW_MESSAGE_CHANNEL}`);
+  });
+
+  subscriber.on("message", (channel, message) => {
+    if (channel === CONNECTION_COUNT_UPDATED_CHANNEL) {
+      app.io.emit(CONNECTION_COUNT_UPDATED_CHANNEL, {
+        count: parseInt(message, 10),
+      });
+      return;
+    }
+
+    if (channel === NEW_MESSAGE_CHANNEL) {
+      app.io.emit(NEW_MESSAGE_CHANNEL, {
+        message,
+        id: randomUUID(),
+        createdAt: new Date(),
+        port: PORT,
+      });
+      return;
+    }
+
+    console.log(`Message received at ${channel}: ${message}`);
   });
 
   app.get("/healthcheck", () => {
@@ -52,6 +132,24 @@ async function main() {
       port: PORT,
       host: HOST,
     });
+
+    closeWithGrace({ delay: 2000 }, async ({ signal, err }) => {
+      if (connectedClients > 0) {
+        console.log("Waiting for connected clients to disconnect");
+        const currentCount = parseInt(
+          (await publisher.get(CONNECTION_COUNT_KEY)) || "0",
+          10
+        );
+
+        const newCount = Math.max(currentCount - connectedClients, 0);
+
+        await publisher.set(CONNECTION_COUNT_KEY, String(newCount));
+      }
+
+      await app.close();
+      console.log("Gracefully shutting down");
+    });
+
     console.log(`Server started at http://${HOST}:${PORT}`);
   } catch (err) {
     console.error(err);
